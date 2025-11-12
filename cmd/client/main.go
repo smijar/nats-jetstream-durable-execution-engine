@@ -11,6 +11,7 @@ import (
 	natsjs "github.com/nats-io/nats.go/jetstream"
 	"github.com/sanjaymijar/my-durable-execution/pb/durable"
 	hellopb "github.com/sanjaymijar/my-durable-execution/pb/hello"
+	durableSDK "github.com/sanjaymijar/my-durable-execution/pkg/durable"
 	"github.com/sanjaymijar/my-durable-execution/pkg/execution"
 	"github.com/sanjaymijar/my-durable-execution/pkg/jetstream"
 	"google.golang.org/protobuf/proto"
@@ -28,8 +29,11 @@ func main() {
 	}
 	defer jsClient.Close()
 
+	// Create a service registry (empty for client)
+	serviceRegistry := durableSDK.NewServiceRegistry()
+
 	// Create processor (for command submission only)
-	processor, err := execution.NewProcessor(jsClient)
+	processor, err := execution.NewProcessor(jsClient, serviceRegistry)
 	if err != nil {
 		log.Fatalf("Failed to create processor: %v", err)
 	}

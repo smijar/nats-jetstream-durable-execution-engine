@@ -7,10 +7,6 @@ import (
 	"time"
 
 	"github.com/sanjaymijar/my-durable-execution/pb/durable"
-	hellopb "github.com/sanjaymijar/my-durable-execution/pb/hello"
-	ticketpb "github.com/sanjaymijar/my-durable-execution/pb/ticket"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -31,6 +27,36 @@ func (e *AwakeableSuspendError) Error() string {
 	return fmt.Sprintf("awakeable %s not resolved yet, suspending workflow", e.AwakeableID)
 }
 
+// ServiceRegistry holds invokers for different services
+type ServiceRegistry struct {
+	invokers map[string]Invoker
+}
+
+// NewServiceRegistry creates a new service registry
+func NewServiceRegistry() *ServiceRegistry {
+	return &ServiceRegistry{
+		invokers: make(map[string]Invoker),
+	}
+}
+
+// Register registers an invoker for a service
+func (r *ServiceRegistry) Register(serviceName string, invoker Invoker) {
+	r.invokers[serviceName] = invoker
+}
+
+// Get returns an invoker for a service
+func (r *ServiceRegistry) Get(serviceName string) (Invoker, bool) {
+	invoker, exists := r.invokers[serviceName]
+	return invoker, exists
+}
+
+// Close closes all registered invokers
+func (r *ServiceRegistry) Close() {
+	for _, invoker := range r.invokers {
+		invoker.Close()
+	}
+}
+
 // Context provides the durable execution SDK for handlers
 type Context struct {
 	ctx               context.Context
@@ -38,7 +64,7 @@ type Context struct {
 	journal           []*durable.JournalEntry
 	currentStep       int32
 	isReplaying       bool
-	grpcConns         map[string]*grpc.ClientConn
+	services          *ServiceRegistry
 	onJournalStep     func(*durable.JournalEntry) error
 	onStepStart       func(stepNumber int32, stepType string) error           // Called when a new step starts executing
 	onStateChange     func(state map[string][]byte) error                     // Called when workflow state changes
@@ -51,14 +77,14 @@ type Context struct {
 }
 
 // NewContext creates a new durable execution context
-func NewContext(ctx context.Context, invocationID string, journal []*durable.JournalEntry, onJournalStep func(*durable.JournalEntry) error) *Context {
+func NewContext(ctx context.Context, invocationID string, journal []*durable.JournalEntry, services *ServiceRegistry, onJournalStep func(*durable.JournalEntry) error) *Context {
 	return &Context{
 		ctx:           ctx,
 		invocationID:  invocationID,
 		journal:       journal,
 		currentStep:   0,
 		isReplaying:   len(journal) > 0,
-		grpcConns:     make(map[string]*grpc.ClientConn),
+		services:      services,
 		onJournalStep: onJournalStep,
 		state:         make(map[string][]byte),
 		awakeables:    make(map[string]*durable.AwakeableState),
@@ -111,17 +137,17 @@ func (dc *Context) DurableCall(serviceName string, method string, req proto.Mess
 		return fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	// Execute the actual call (this would be a real gRPC call in production)
-	// For now, we'll create a journal entry structure
+	// Execute the actual call
 	entry := &durable.JournalEntry{
 		StepNumber: dc.currentStep,
 		StepType:   stepType,
 		Request:    reqBytes,
 	}
 
-	// Make the actual gRPC call
-	conn, err := dc.getOrCreateConnection(serviceName)
-	if err != nil {
+	// Get the invoker for the service
+	invoker, exists := dc.services.Get(serviceName)
+	if !exists {
+		err := fmt.Errorf("no invoker registered for service: %s", serviceName)
 		entry.Error = err.Error()
 		if dc.onJournalStep != nil {
 			dc.onJournalStep(entry)
@@ -130,9 +156,13 @@ func (dc *Context) DurableCall(serviceName string, method string, req proto.Mess
 		return err
 	}
 
-	// Invoke the method using reflection or a service-specific client
-	// For this implementation, we'll use a generic approach
-	respBytes, err := dc.invokeGRPCMethod(conn, serviceName, method, reqBytes)
+	// Make the call using the invoker
+	respBytes, err := invoker.Invoke(dc.ctx, ServiceCall{
+		ServiceName: serviceName,
+		MethodName:  method,
+		Request:     reqBytes,
+	})
+
 	if err != nil {
 		entry.Error = err.Error()
 		if dc.onJournalStep != nil {
@@ -164,139 +194,9 @@ func (dc *Context) DurableCall(serviceName string, method string, req proto.Mess
 	return nil
 }
 
-// getOrCreateConnection gets or creates a gRPC connection to a service
-func (dc *Context) getOrCreateConnection(serviceName string) (*grpc.ClientConn, error) {
-	if conn, exists := dc.grpcConns[serviceName]; exists {
-		return conn, nil
-	}
-
-	// Default to localhost for services
-	// In production, this would use service discovery
-	serviceAddr := fmt.Sprintf("127.0.0.1:%d", getServicePort(serviceName))
-
-	conn, err := grpc.Dial(serviceAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to %s: %w", serviceName, err)
-	}
-
-	dc.grpcConns[serviceName] = conn
-	return conn, nil
-}
-
-// invokeGRPCMethod invokes a gRPC method generically
-func (dc *Context) invokeGRPCMethod(conn *grpc.ClientConn, service, method string, reqBytes []byte) ([]byte, error) {
-	// This is a simplified implementation
-	// In a real system, you'd use the generated gRPC client stubs
-	// or a reflection-based invoker
-
-	// For the HelloService, we'll handle it specifically
-	if service == "HelloService" && method == "SayHello" {
-		return dc.invokeHelloService(conn, reqBytes)
-	}
-
-	// For the TicketService
-	if service == "TicketService" {
-		switch method {
-		case "Reserve":
-			return dc.invokeTicketReserve(conn, reqBytes)
-		case "Release":
-			return dc.invokeTicketRelease(conn, reqBytes)
-		}
-	}
-
-	return nil, fmt.Errorf("unsupported service: %s.%s", service, method)
-}
-
-// invokeHelloService invokes the HelloService.SayHello method
-func (dc *Context) invokeHelloService(conn *grpc.ClientConn, reqBytes []byte) ([]byte, error) {
-	// Create the HelloService client
-	client := hellopb.NewHelloServiceClient(conn)
-
-	// Unmarshal the request
-	req := &hellopb.HelloRequest{}
-	if err := proto.Unmarshal(reqBytes, req); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal HelloRequest: %w", err)
-	}
-
-	// Make the actual gRPC call
-	resp, err := client.SayHello(dc.ctx, req)
-	if err != nil {
-		return nil, fmt.Errorf("SayHello RPC failed: %w", err)
-	}
-
-	// Marshal the response
-	respBytes, err := proto.Marshal(resp)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal HelloResponse: %w", err)
-	}
-
-	return respBytes, nil
-}
-
-// invokeTicketReserve invokes TicketService.Reserve
-func (dc *Context) invokeTicketReserve(conn *grpc.ClientConn, reqBytes []byte) ([]byte, error) {
-	client := ticketpb.NewTicketServiceClient(conn)
-
-	req := &ticketpb.ReserveRequest{}
-	if err := proto.Unmarshal(reqBytes, req); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal ReserveRequest: %w", err)
-	}
-
-	resp, err := client.Reserve(dc.ctx, req)
-	if err != nil {
-		return nil, fmt.Errorf("Reserve RPC failed: %w", err)
-	}
-
-	respBytes, err := proto.Marshal(resp)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal ReserveResponse: %w", err)
-	}
-
-	return respBytes, nil
-}
-
-// invokeTicketRelease invokes TicketService.Release
-func (dc *Context) invokeTicketRelease(conn *grpc.ClientConn, reqBytes []byte) ([]byte, error) {
-	client := ticketpb.NewTicketServiceClient(conn)
-
-	req := &ticketpb.ReleaseRequest{}
-	if err := proto.Unmarshal(reqBytes, req); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal ReleaseRequest: %w", err)
-	}
-
-	resp, err := client.Release(dc.ctx, req)
-	if err != nil {
-		return nil, fmt.Errorf("Release RPC failed: %w", err)
-	}
-
-	respBytes, err := proto.Marshal(resp)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal ReleaseResponse: %w", err)
-	}
-
-	return respBytes, nil
-}
-
-// getServicePort returns the port for a given service
-func getServicePort(serviceName string) int {
-	// Service port mapping
-	ports := map[string]int{
-		"HelloService":  9090,
-		"TicketService": 9091,
-	}
-
-	if port, exists := ports[serviceName]; exists {
-		return port
-	}
-
-	return 9000 // default port
-}
-
 // Close closes all gRPC connections
 func (dc *Context) Close() {
-	for _, conn := range dc.grpcConns {
-		conn.Close()
-	}
+	// The processor is now responsible for closing invokers
 }
 
 // InvocationID returns the current invocation ID

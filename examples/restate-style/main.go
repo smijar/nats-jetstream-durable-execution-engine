@@ -97,34 +97,35 @@ func main() {
 	fmt.Printf("Result: %s\n", greeting2)
 	fmt.Println()
 
-	// ====================================================================================
-	// Example 3: Local Development Mode (everything in one process)
-	// ====================================================================================
+	// 3. Local development mode (in-process execution)
+	log.Println("▶️  Running in local development mode...")
+	localCtx, localCancel := context.WithCancel(context.Background())
+	defer localCancel()
 
-	fmt.Println("Example 3: Local Development Mode")
-	fmt.Println("---------------------------------------")
+	// For local execution, the client also needs a service registry
+	localServiceRegistry := durable.NewServiceRegistry()
+	localServiceRegistry.Register("HelloService", durable.NewGRPCInvoker("127.0.0.1:9090"))
+	defer localServiceRegistry.Close()
 
-	// Register for local execution
+	// Set the service registry on the client for local execution
+	c.SetServiceRegistry(localServiceRegistry)
+
+	// The client can register handlers and serve them locally
 	c.Register(HelloWorkflow)
 	c.Register(GreetManyWorkflow)
+	go func() {
+		if err := c.ServeHandlers(localCtx); err != nil {
+			log.Printf("Local handler server error: %v", err)
+		}
+	}()
+	time.Sleep(100 * time.Millisecond) // Give server time to start
 
-	// Start serving locally
-	localCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	go c.ServeHandlers(localCtx)
-
-	// Give ServeHandlers time to start
-	time.Sleep(100 * time.Millisecond)
-
-	// Now invocations run locally without NATS!
-	localResult, err := client.InvokeWorkflow[string, string](c, localCtx, HelloWorkflow, "Local")
+	result3, err := client.InvokeWorkflow[string, string](c, ctx, HelloWorkflow, "Local")
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("Error invoking workflow locally: %v", err)
 	}
-
-	fmt.Printf("Local result: %s\n", localResult)
-	fmt.Println()
+	log.Println("✅ Local execution successful!")
+	log.Printf("   Result: %s\n", result3)
 
 	// ====================================================================================
 	// Example 4: Workflow Composition (workflow calling workflow)

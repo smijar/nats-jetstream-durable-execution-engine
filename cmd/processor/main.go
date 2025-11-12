@@ -58,8 +58,14 @@ func main() {
 		log.Fatalf("Failed to setup KV buckets: %v", err)
 	}
 
+	// Create a registry for our services and their invokers
+	serviceRegistry := durableSDK.NewServiceRegistry()
+	serviceRegistry.Register("HelloService", durableSDK.NewGRPCInvoker("127.0.0.1:9090"))
+	serviceRegistry.Register("TicketService", durableSDK.NewGRPCInvoker("127.0.0.1:9091"))
+	defer serviceRegistry.Close()
+
 	// Create processor
-	processor, err := execution.NewProcessor(jsClient)
+	processor, err := execution.NewProcessor(jsClient, serviceRegistry)
 	if err != nil {
 		log.Fatalf("Failed to create processor: %v", err)
 	}
@@ -163,12 +169,17 @@ func main() {
 // Workflow Definitions (Restate-style)
 // ====================================================================================
 
+// HelloWorkflowInput represents input for HelloWorkflow
+type HelloWorkflowInput struct {
+	Name string `json:"name"`
+}
+
 // HelloWorkflow - for backward compatibility with older examples
 var HelloWorkflow = durableSDK.NewWorkflow("hello_workflow",
-	func(ctx *durableSDK.Context, name string) (string, error) {
-		log.Printf("Executing HelloWorkflow: invocation_id=%s", ctx.InvocationID())
+	func(ctx *durableSDK.Context, input HelloWorkflowInput) (string, error) {
+		log.Printf("Executing HelloWorkflow: invocation_id=%s name=%s", ctx.InvocationID(), input.Name)
 
-		req := &hellopb.HelloRequest{Name: name}
+		req := &hellopb.HelloRequest{Name: input.Name}
 		resp := &hellopb.HelloResponse{}
 
 		if err := ctx.DurableCall("HelloService", "SayHello", req, resp); err != nil {
@@ -624,11 +635,18 @@ var ExpenseApprovalWorkflow = durableSDK.NewWorkflow("expense_approval",
 
 // submitTestCommand submits a test command for demonstration
 func submitTestCommand(ctx context.Context, processor *execution.Processor) error {
+	// Marshal the input struct to JSON
+	input := HelloWorkflowInput{Name: "TestClient"}
+	args, err := json.Marshal(input)
+	if err != nil {
+		return fmt.Errorf("failed to marshal test command args: %w", err)
+	}
+
 	cmd := &durable.Command{
 		InvocationId: uuid.New().String(),
 		Handler:      "hello_workflow",
 		Service:      "HelloService",
-		Args:         []byte{},
+		Args:         args,
 		PartitionKey: "default",
 		Sequence:     1,
 	}

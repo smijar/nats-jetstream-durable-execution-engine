@@ -10,10 +10,15 @@ import (
 	"github.com/sanjaymijar/my-durable-execution/pkg/durable"
 )
 
+// HelloWorkflowInput represents input for HelloWorkflow
+type HelloWorkflowInput struct {
+	Name string `json:"name"`
+}
+
 // Define workflows with full type safety
 var HelloWorkflow = durable.NewWorkflow("hello_workflow",
-	func(ctx *durable.Context, name string) (string, error) {
-		req := &hellopb.HelloRequest{Name: name}
+	func(ctx *durable.Context, input HelloWorkflowInput) (string, error) {
+		req := &hellopb.HelloRequest{Name: input.Name}
 		resp := &hellopb.HelloResponse{}
 
 		if err := ctx.DurableCall("HelloService", "SayHello", req, resp); err != nil {
@@ -30,8 +35,9 @@ func main() {
 	}
 	defer c.Close()
 
-	// Type-safe invocation - input is string, output is string
-	result, err := client.InvokeWorkflow[string, string](c, context.Background(), HelloWorkflow, "TypeSafe World")
+	// Type-safe invocation - input is HelloWorkflowInput, output is string
+	input := HelloWorkflowInput{Name: "TypeSafe World"}
+	result, err := client.InvokeWorkflow[HelloWorkflowInput, string](c, context.Background(), HelloWorkflow, input)
 	if err != nil {
 		log.Fatal(err)
 	}

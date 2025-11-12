@@ -11,14 +11,22 @@ import (
 
 func main() {
 	// Create client and invoke workflow
-	c, _ := client.NewClient("nats://127.0.0.1:4322")
+	c, err := client.NewClient("nats://127.0.0.1:4322")
+	if err != nil {
+		log.Fatalf("Failed to create client: %v", err)
+	}
 	defer c.Close()
 
-	result, _ := c.Invoke(context.Background(), "hello_workflow")
+	result, err := c.Invoke(context.Background(), "hello_workflow", client.WithArgs([]byte(`{"name": "Simple Client"}`)))
+	if err != nil {
+		log.Fatalf("Failed to invoke workflow: %v", err)
+	}
 
 	// Extract response
 	var resp hellopb.HelloResponse
-	result.GetFirstResponse(&resp)
+	if err := result.GetFirstResponse(&resp); err != nil {
+		log.Fatalf("Failed to get first response: %v", err)
+	}
 
 	fmt.Println(resp.Message)
 }

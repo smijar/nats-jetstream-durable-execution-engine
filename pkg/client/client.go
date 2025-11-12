@@ -22,6 +22,7 @@ type Client struct {
 	processor *execution.Processor
 	timeout   time.Duration
 	registry  *durableSDK.WorkflowRegistry
+	serviceRegistry *durableSDK.ServiceRegistry
 	serving   bool
 }
 
@@ -37,7 +38,8 @@ func NewClientWithTimeout(natsURL string, timeout time.Duration) (*Client, error
 		return nil, fmt.Errorf("failed to connect to NATS: %w", err)
 	}
 
-	processor, err := execution.NewProcessor(jsClient)
+	serviceRegistry := durableSDK.NewServiceRegistry()
+	processor, err := execution.NewProcessor(jsClient, serviceRegistry)
 	if err != nil {
 		jsClient.Close()
 		return nil, fmt.Errorf("failed to create processor: %w", err)
@@ -48,6 +50,7 @@ func NewClientWithTimeout(natsURL string, timeout time.Duration) (*Client, error
 		processor: processor,
 		timeout:   timeout,
 		registry:  durableSDK.NewWorkflowRegistry(),
+		serviceRegistry: serviceRegistry,
 		serving:   false,
 	}, nil
 }
@@ -502,6 +505,11 @@ func WithLimit(limit int) WorkflowFilter {
 
 
 // ====================================================================================
+// SetServiceRegistry sets the service registry for local execution
+func (c *Client) SetServiceRegistry(registry *durableSDK.ServiceRegistry) {
+	c.serviceRegistry = registry
+}
+
 // Type-Safe Workflow API (Restate-style)
 // ====================================================================================
 
@@ -528,7 +536,7 @@ func (c *Client) executeLocal(ctx context.Context, workflowName string, inputByt
 	}
 
 	// Create a durable context for local execution
-	durableCtx := durableSDK.NewContext(ctx, uuid.New().String(), nil, func(entry *durable.JournalEntry) error {
+	durableCtx := durableSDK.NewContext(ctx, uuid.New().String(), nil, c.serviceRegistry, func(entry *durable.JournalEntry) error {
 		// In local mode, we don't persist journal entries
 		return nil
 	})

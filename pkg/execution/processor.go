@@ -21,10 +21,11 @@ type Processor struct {
 	jsClient *jetstream.Client
 	handlers map[string]HandlerFunc
 	kv       natsjs.KeyValue
+	services *durableCtx.ServiceRegistry
 }
 
 // NewProcessor creates a new execution processor
-func NewProcessor(jsClient *jetstream.Client) (*Processor, error) {
+func NewProcessor(jsClient *jetstream.Client, services *durableCtx.ServiceRegistry) (*Processor, error) {
 	ctx := context.Background()
 
 	kv, err := jsClient.GetStateKV(ctx)
@@ -36,6 +37,7 @@ func NewProcessor(jsClient *jetstream.Client) (*Processor, error) {
 		jsClient: jsClient,
 		handlers: make(map[string]HandlerFunc),
 		kv:       kv,
+		services: services,
 	}, nil
 }
 
@@ -153,7 +155,7 @@ func (p *Processor) processMessage(ctx context.Context, msg natsjs.Msg) error {
 	}
 
 	// Create durable context for execution
-	durableContext := durableCtx.NewContext(ctx, cmd.InvocationId, state.Journal, func(entry *durable.JournalEntry) error {
+	durableContext := durableCtx.NewContext(ctx, cmd.InvocationId, state.Journal, p.services, func(entry *durable.JournalEntry) error {
 		// Journal step callback - append to state and save
 		state.Journal = append(state.Journal, entry)
 		return p.saveState(ctx, state)

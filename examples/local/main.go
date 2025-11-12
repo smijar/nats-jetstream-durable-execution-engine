@@ -25,27 +25,30 @@ var HelloWorkflow = durable.NewWorkflow("hello_local",
 	})
 
 func main() {
+	ctx := context.Background()
+
 	c, err := client.NewClient("nats://127.0.0.1:4322")
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer c.Close()
 
-	// Register workflow for local execution
+	// For local execution, we need to provide the service invokers
+	localServiceRegistry := durable.NewServiceRegistry()
+	localServiceRegistry.Register("HelloService", durable.NewGRPCInvoker("127.0.0.1:9090"))
+	defer localServiceRegistry.Close()
+
+	// Set the service registry on the client for local execution
+	c.SetServiceRegistry(localServiceRegistry)
+
+	// Register workflow handler locally
 	c.Register(HelloWorkflow)
-
-	// Serve handlers locally in background
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	go func() {
-		if err := c.ServeHandlers(ctx); err != nil && err != context.Canceled {
-			log.Printf("Server error: %v", err)
+		if err := c.ServeHandlers(ctx); err != nil {
+			log.Printf("Local handler server error: %v", err)
 		}
 	}()
-
-	// Give ServeHandlers time to start
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(100 * time.Millisecond) // Give server time to start
 
 	// Now invoke the workflow - it runs locally, no NATS needed!
 	result, err := client.InvokeWorkflow[string, string](c, ctx, HelloWorkflow, "Local World")

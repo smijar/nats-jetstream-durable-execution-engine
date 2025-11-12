@@ -98,6 +98,15 @@ func main() {
 	// Example 2: Local execution (faster for development)
 	fmt.Println("Example 2: Local Execution")
 	fmt.Println("----------------------------")
+
+	// For local execution, we need to provide the service invokers
+	localServiceRegistry := durable.NewServiceRegistry()
+	localServiceRegistry.Register("HelloService", durable.NewGRPCInvoker("127.0.0.1:9090"))
+	defer localServiceRegistry.Close()
+
+	// Set the service registry on the client for local execution
+	c.SetServiceRegistry(localServiceRegistry)
+
 	c.Register(MultiServiceWorkflow)
 	go c.ServeHandlers(ctx)
 
