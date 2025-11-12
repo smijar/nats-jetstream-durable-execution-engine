@@ -1,11 +1,67 @@
 # Durable Execution Engine on NATS JetStream
 
-A production-ready durable execution engine built on NATS JetStream in Go. This system provides deterministic workflow execution with exactly-once semantics, automatic replay, and fault tolerance.
+A durable execution engine built on NATS JetStream in Go. This system provides deterministic workflow execution with exactly-once semantics, automatic replay, and fault tolerance.
 
-## Quick Example (5 lines!)
+## Why?
+
+Did not find anything suitable that runs on NATS JetStream with workflow semantics to make event-based execution engines easy to use. So this is modeled after Restate's workflow engine but:
+
+- **Built in Go** with gRPC services instead of HTTP endpoints
+- **Services register with NATS subjects/topics** rather than HTTP endpoints
+- **Uses NATS request/reply semantics** - no need for API endpoints/ports for every workflow function
+- **NATS KV store for state** - single subsystem for messaging and state persistence
+- **Future-ready**: Possibility for cross-cluster workflow routing across NATS boundaries
+
+## Hello World - Complete Example
+
+Here's everything you need to register a workflow handler and invoke it:
+
+### 1. Define Your Workflow Handler
 
 ```go
-c, _ := client.NewClient("nats://127.0.0.1:4322")
+// cmd/processor/main.go
+func helloWorkflowHandler(ctx *durable.Context) error {
+    log.Printf("Executing hello workflow: invocation_id=%s", ctx.InvocationID())
+
+    // Make a durable gRPC call
+    req := &hellopb.HelloRequest{Name: "World"}
+    resp := &hellopb.HelloResponse{}
+
+    if err := ctx.DurableCall("HelloService", "SayHello", req, resp); err != nil {
+        return fmt.Errorf("failed to call HelloService: %w", err)
+    }
+
+    log.Printf("Hello workflow completed: message=%s", resp.Message)
+    return nil
+}
+```
+
+### 2. Register the Handler with Processor
+
+```go
+// cmd/processor/main.go
+func main() {
+    // Connect to NATS
+    jsClient, _ := jetstream.NewClient("nats://localhost:4222")
+    defer jsClient.Close()
+
+    // Create processor
+    processor, _ := execution.NewProcessor(jsClient)
+
+    // Register your workflow handler
+    processor.RegisterHandler("hello_workflow", helloWorkflowHandler)
+
+    // Start processing
+    ctx := context.Background()
+    processor.Start(ctx, "processor-1")
+}
+```
+
+### 3. Invoke from Client (Simple - 5 lines!)
+
+```go
+// Your application code
+c, _ := client.NewClient("nats://127.0.0.1:4222")
 defer c.Close()
 
 result, _ := c.Invoke(context.Background(), "hello_workflow")
@@ -16,7 +72,9 @@ fmt.Println(resp.Message)
 // Output: Hello, World! Welcome to Durable Execution on NATS JetStream.
 ```
 
-**See [SIMPLE_CLIENT.md](SIMPLE_CLIENT.md) for the simple SDK** or continue reading for the full architecture.
+**That's it!** The workflow survives failures, automatically replays from journal, and provides exactly-once execution guarantees.
+
+**See [examples/README.md](examples/README.md) for more patterns** or continue reading for architecture details.
 
 ## Features
 
@@ -83,6 +141,468 @@ Client → Command Stream → Processor → Load State from KV
 ├── go.mod                # Go module file
 └── Makefile              # Build and run commands
 ```
+
+---
+
+# Developer Guide
+
+This section shows you how to build applications using the Durable Execution Engine. For setup instructions, see [Prerequisites](#prerequisites) below.
+
+## Client SDK - Simple Usage
+
+The client SDK makes it incredibly simple to invoke workflows:
+
+### Basic Invocation (5 lines)
+
+```go
+c, _ := client.NewClient("nats://127.0.0.1:4222")
+defer c.Close()
+
+result, _ := c.Invoke(context.Background(), "hello_workflow")
+var resp hellopb.HelloResponse
+result.GetFirstResponse(&resp)
+
+fmt.Println(resp.Message)
+```
+
+### With Proper Error Handling
+
+```go
+c, err := client.NewClient("nats://127.0.0.1:4222")
+if err != nil {
+    log.Fatal(err)
+}
+defer c.Close()
+
+result, err := c.Invoke(context.Background(), "hello_workflow")
+if err != nil {
+    log.Fatal(err)
+}
+
+var resp hellopb.HelloResponse
+if err := result.GetFirstResponse(&resp); err != nil {
+    log.Fatal(err)
+}
+
+fmt.Println("Response:", resp.Message)
+```
+
+### Async Invocation (Fire and Forget)
+
+```go
+c, _ := client.NewClient("nats://127.0.0.1:4222")
+defer c.Close()
+
+// Submit without waiting
+invocationID, _ := c.InvokeAsync(context.Background(), "hello_workflow")
+fmt.Printf("Submitted: %s\n", invocationID)
+
+// Do other work...
+time.Sleep(2 * time.Second)
+
+// Check result later
+result, _ := c.GetResult(context.Background(), invocationID)
+var resp hellopb.HelloResponse
+result.GetFirstResponse(&resp)
+fmt.Println(resp.Message)
+```
+
+### With Options
+
+```go
+result, err := c.Invoke(
+    context.Background(),
+    "hello_workflow",
+    client.WithPartitionKey("user-123"),
+    client.WithService("HelloService"),
+    client.WithArgs(inputBytes),
+)
+```
+
+### Custom Timeout
+
+```go
+// 5 second timeout
+c, err := client.NewClientWithTimeout("nats://127.0.0.1:4222", 5*time.Second)
+```
+
+## Defining Workflow Handlers
+
+Workflow handlers receive a `durable.Context` and can make durable calls to gRPC services.
+
+### Single-Step Workflow
+
+```go
+func helloWorkflowHandler(ctx *durable.Context) error {
+    log.Printf("Executing hello workflow: invocation_id=%s", ctx.InvocationID())
+
+    // Make a durable gRPC call
+    req := &hellopb.HelloRequest{Name: "World"}
+    resp := &hellopb.HelloResponse{}
+
+    if err := ctx.DurableCall("HelloService", "SayHello", req, resp); err != nil {
+        return fmt.Errorf("failed to call HelloService: %w", err)
+    }
+
+    log.Printf("Hello workflow completed: message=%s", resp.Message)
+    return nil
+}
+```
+
+### Multi-Step Workflow
+
+Workflows can make multiple durable calls. Each step is journaled separately:
+
+```go
+func orderProcessingWorkflow(ctx *durable.Context) error {
+    log.Printf("Starting order processing: invocation_id=%s", ctx.InvocationID())
+
+    // Step 1: Validate order
+    validateReq := &orderpb.ValidateRequest{OrderId: "order-123"}
+    validateResp := &orderpb.ValidateResponse{}
+    if err := ctx.DurableCall("OrderService", "Validate", validateReq, validateResp); err != nil {
+        return fmt.Errorf("validation failed: %w", err)
+    }
+
+    // Step 2: Process payment
+    paymentReq := &paymentpb.ChargeRequest{Amount: 99.99}
+    paymentResp := &paymentpb.ChargeResponse{}
+    if err := ctx.DurableCall("PaymentService", "Charge", paymentReq, paymentResp); err != nil {
+        return fmt.Errorf("payment failed: %w", err)
+    }
+
+    // Step 3: Ship order
+    shipReq := &shippingpb.ShipRequest{OrderId: "order-123"}
+    shipResp := &shippingpb.ShipResponse{}
+    if err := ctx.DurableCall("ShippingService", "Ship", shipReq, shipResp); err != nil {
+        return fmt.Errorf("shipping failed: %w", err)
+    }
+
+    log.Printf("Order processing completed: tracking=%s", shipResp.TrackingNumber)
+    return nil
+}
+```
+
+**Key benefits:**
+- If the workflow fails at step 2, on retry it will replay steps 1-2 from the journal and only re-execute step 3
+- Each step is journaled with its request and response
+- State is persisted after each step
+- The workflow is deterministic across retries
+
+### Registering Handlers
+
+In your processor main (`cmd/processor/main.go`):
+
+```go
+func main() {
+    // Connect to NATS
+    jsClient, err := jetstream.NewClient("nats://localhost:4222")
+    if err != nil {
+        log.Fatalf("Failed to connect: %v", err)
+    }
+    defer jsClient.Close()
+
+    // Create processor
+    processor, err := execution.NewProcessor(jsClient)
+    if err != nil {
+        log.Fatalf("Failed to create processor: %v", err)
+    }
+
+    // Register workflow handlers
+    processor.RegisterHandler("hello_workflow", helloWorkflowHandler)
+    processor.RegisterHandler("order_processing", orderProcessingWorkflow)
+    processor.RegisterHandler("payment_refund", paymentRefundWorkflow)
+
+    // Start processor
+    ctx := context.Background()
+    processor.Start(ctx, "processor-1")
+}
+```
+
+## Advanced Patterns
+
+### Type-Safe Workflows
+
+Use generics for compile-time type safety:
+
+```go
+// Define a type-safe workflow
+var HelloWorkflow = durable.NewWorkflow("hello_workflow",
+    func(ctx *durable.Context, name string) (string, error) {
+        req := &hellopb.HelloRequest{Name: name}
+        resp := &hellopb.HelloResponse{}
+
+        if err := ctx.DurableCall("HelloService", "SayHello", req, resp); err != nil {
+            return "", err
+        }
+
+        return resp.Message, nil
+    })
+
+// Invoke with type safety - compiler checks input/output types
+result, err := client.InvokeWorkflow[string, string](c, ctx, HelloWorkflow, "TypeSafe World")
+fmt.Println(result) // string type, no unmarshaling needed!
+```
+
+**Benefits:**
+- Compile-time type checking
+- No manual marshaling/unmarshaling
+- Refactoring-friendly
+- IDE autocomplete support
+
+### Workflow State Management
+
+Persist workflow-scoped state across steps (like Restate's `ctx.get()` / `ctx.set()`):
+
+```go
+var AddToCartWorkflow = durable.NewWorkflow("add_to_cart",
+    func(ctx *durable.Context, ticketID string) (bool, error) {
+        // Step 1: Reserve the ticket
+        req := &ticketpb.ReserveRequest{TicketId: ticketID}
+        resp := &ticketpb.ReserveResponse{}
+        ctx.DurableCall("TicketService", "Reserve", req, resp)
+
+        if resp.Success {
+            // Step 2: Get current cart from workflow state
+            var cart []string
+            err := ctx.Get("cart", &cart)
+            if err != nil {
+                cart = []string{}  // Cart doesn't exist yet
+            }
+
+            // Add ticket to cart
+            cart = append(cart, ticketID)
+
+            // Save updated cart (automatically persisted)
+            ctx.Set("cart", cart)
+        }
+
+        return resp.Success, nil
+    })
+```
+
+**Use Cases:**
+- Shopping carts
+- User sessions
+- Workflow-scoped counters
+- Multi-step form data
+- Accumulating results
+
+### Delayed Execution
+
+Schedule workflows to run in the future (like Restate's `ctx.sendDelayed()`):
+
+```go
+var SchedulerWorkflow = durable.NewWorkflow("scheduler",
+    func(ctx *durable.Context, input SchedulerInput) (string, error) {
+        // Do some work first
+        req := &hellopb.HelloRequest{Name: "Scheduler"}
+        resp := &hellopb.HelloResponse{}
+        ctx.DurableCall("HelloService", "SayHello", req, resp)
+
+        // Schedule a delayed workflow invocation
+        delayDuration := 15 * time.Minute
+        greetingInput := GreetingInput{Name: input.Message}
+
+        // This schedules the workflow to run after the delay
+        ctx.SendDelayed("delayed_greeting", greetingInput, delayDuration, "partition-key")
+
+        return "Scheduled greeting for future execution", nil
+    })
+```
+
+**Use Cases:**
+- Timeout/expiry timers (expire cart items)
+- Reminder notifications
+- Scheduled maintenance tasks
+- Rate limiting with delays
+- Retry with exponential backoff
+
+### Awakeables (External Callbacks)
+
+Pause workflows waiting for external events (like Restate's `ctx.awakeable()`):
+
+```go
+var ExpenseApprovalWorkflow = durable.NewWorkflow("expense_approval",
+    func(ctx *durable.Context, request ExpenseRequest) (string, error) {
+        // Step 1: Log the expense request
+        req := &hellopb.HelloRequest{Name: fmt.Sprintf("Expense from %s", request.EmployeeID)}
+        resp := &hellopb.HelloResponse{}
+        ctx.DurableCall("HelloService", "SayHello", req, resp)
+
+        // Step 2: Create awakeable and wait for manager approval
+        awakeableID := fmt.Sprintf("approval-%s", uuid.New().String())
+
+        log.Printf("⏳ Waiting for manager approval (ID: %s)", awakeableID)
+
+        // Workflow SUSPENDS here until external system resolves the awakeable
+        resultBytes, err := ctx.Awakeable(awakeableID)
+        if err != nil {
+            return "Rejected", err
+        }
+
+        // Step 3: Parse approval result and continue
+        var approval ApprovalResult
+        json.Unmarshal(resultBytes, &approval)
+
+        if approval.Approved {
+            return fmt.Sprintf("✅ Approved: $%.2f", request.Amount), nil
+        }
+
+        return fmt.Sprintf("❌ Rejected: $%.2f", request.Amount), nil
+    })
+```
+
+**Resolving Awakeables:**
+
+```bash
+# Approve the expense (external system calls this)
+curl -X POST http://localhost:8080/api/awakeables/approval-abc123/resolve \
+  -H 'Content-Type: application/json' \
+  -d '{"result": "{\"approved\": true, \"comments\": \"Approved!\"}"}'
+
+# Or reject it
+curl -X POST http://localhost:8080/api/awakeables/approval-abc123/reject \
+  -H 'Content-Type: application/json' \
+  -d '{"error": "Amount too high"}'
+```
+
+**Use Cases:**
+- Human approvals (manager approves expense, PR review)
+- Payment webhooks (Stripe, PayPal notify completion)
+- External API callbacks (3rd party service completes job)
+- Email confirmations (user clicks link)
+- Manual interventions
+
+### Workflow Lifecycle Control
+
+#### Pause & Resume
+
+Temporarily pause a workflow and resume it later (same invocation ID):
+
+```go
+// Submit a workflow
+invocationID, _ := c.InvokeAsync(ctx, "slow_workflow", client.WithArgs(inputBytes))
+
+// Let it run for a bit...
+time.Sleep(1 * time.Second)
+
+// PAUSE the workflow
+c.Pause(ctx, invocationID)
+
+// Check status
+result, _ := c.GetResult(ctx, invocationID)
+fmt.Printf("Status: %s\n", result.Status)  // "paused"
+
+// RESUME from where it left off
+c.Resume(ctx, invocationID)
+```
+
+#### Cancel
+
+Permanently stop a workflow execution:
+
+```go
+// Cancel a running or paused workflow
+c.Cancel(ctx, invocationID)
+
+result, _ := c.GetResult(ctx, invocationID)
+fmt.Printf("Status: %s\n", result.Status)  // "cancelled"
+```
+
+#### Failure Detection & Retry
+
+Identify failed workflows and retry them with new invocation IDs:
+
+```go
+// Submit workflows
+invocationID, _ := c.InvokeAsync(ctx, "flaky_workflow", client.WithArgs(inputBytes))
+
+// Wait for completion
+time.Sleep(5 * time.Second)
+
+// Check if workflow failed
+result, _ := c.GetResult(ctx, invocationID)
+if result.Status == "failed" {
+    // Retry with a new invocation ID
+    retryInput := input + "-retry"
+    inputBytes, _ := json.Marshal(retryInput)
+    newID, _ := c.InvokeAsync(ctx, "flaky_workflow", client.WithArgs(inputBytes))
+    fmt.Printf("Retrying with new ID: %s\n", newID)
+}
+```
+
+**Comparison: Pause vs Cancel+Retry**
+
+| Feature | Pause/Resume | Cancel + Retry |
+|---------|--------------|----------------|
+| **Invocation ID** | Same ID continues | New ID created |
+| **Journal** | Resumes from journal | Fresh start |
+| **Use Case** | Temporary hold, waiting for resources | Transient failures, input correction |
+| **When to use** | Rate limiting, approvals | Failures, retry logic |
+
+### Concurrent Workflow Invocations
+
+Invoke the same workflow multiple times concurrently:
+
+```go
+// Define a 3-step workflow
+var AsyncWorkflow = durable.NewWorkflow("async_workflow",
+    func(ctx *durable.Context, userID string) (string, error) {
+        // Step 1: Greeting
+        req1 := &hellopb.HelloRequest{Name: fmt.Sprintf("User:%s", userID)}
+        resp1 := &hellopb.HelloResponse{}
+        ctx.DurableCall("HelloService", "SayHello", req1, resp1)
+
+        // Step 2: Notification
+        req2 := &hellopb.HelloRequest{Name: fmt.Sprintf("Async:%s", userID)}
+        resp2 := &hellopb.HelloResponse{}
+        ctx.DurableCall("HelloService", "SayHello", req2, resp2)
+
+        // Step 3: Confirmation
+        req3 := &hellopb.HelloRequest{Name: fmt.Sprintf("Confirm:%s", userID)}
+        resp3 := &hellopb.HelloResponse{}
+        ctx.DurableCall("HelloService", "SayHello", req3, resp3)
+
+        return fmt.Sprintf("Completed: %s, %s, %s",
+            resp1.Message, resp2.Message, resp3.Message), nil
+    })
+
+// Invoke N times concurrently
+for i := 0; i < 100; i++ {
+    go func(userID string) {
+        result, _ := client.InvokeWorkflow[string, string](c, ctx, AsyncWorkflow, userID)
+        fmt.Println(result)
+    }(fmt.Sprintf("user-%03d", i))
+}
+```
+
+**Use Cases:**
+- Load testing workflows
+- Bulk processing (100 user notifications)
+- Demonstrating system scalability
+- Testing concurrent execution guarantees
+
+## Complete Examples
+
+See [examples/README.md](examples/README.md) for runnable examples:
+
+| Example | Description | Run Command |
+|---------|-------------|-------------|
+| `simple/` | Minimal 5-line example | `make run-simple` |
+| `async/` | Fire-and-forget + result polling | `make run-async` |
+| `typed/` | Type-safe workflows with generics | `make run-typed` |
+| `local/` | Local in-process execution | `make run-local` |
+| `multi-service/` | Multiple service calls in one workflow | `make run-multi-service` |
+| `concurrent-workflows/` | N concurrent workflow invocations | `make run-concurrent` |
+| `retry-failures/` | Detect failed workflows and retry | `make run-retry` |
+| `pause-cancel/` | Pause/resume or cancel workflows | `make run-pause` |
+| `ticket-cart/` | Workflow state management | `make run-ticket-cart` |
+| `delayed-execution/` | Schedule workflows for future | `make run-delayed` |
+| `approval-workflow/` | Awakeables for external callbacks | `make run-approval` |
+| `query-api/` | Query workflow status via HTTP | `make run-query` |
+
+---
 
 ## Prerequisites
 

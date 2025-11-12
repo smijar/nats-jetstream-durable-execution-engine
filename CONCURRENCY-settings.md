@@ -1,4 +1,3 @@
-⏺ Great question! Let me explain MaxAckPending and its impact on workflow execution:
 
   What is MaxAckPending?
 
@@ -159,10 +158,6 @@
 
   ----
 
-
-  ⏺ Perfect! I've successfully added both configurable settings to the processor. Here's what was implemented:
-
-  ✅ Changes Summary
 
   1. --max-concurrent Flag (Controls MaxAckPending)
 
