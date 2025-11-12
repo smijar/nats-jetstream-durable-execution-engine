@@ -1,0 +1,46 @@
+version: '3.8'
+
+services:
+  nats-1:
+    image: nats:2.10-alpine
+    container_name: nats-1
+    ports:
+      - "4322:4222"
+      - "8322:8222"
+    volumes:
+      - ./nats.conf:/etc/nats/nats.conf
+    command: ["-c", "/etc/nats/nats.conf", "--name", "nats-1", "--cluster_name", "nats-cluster"]
+    networks:
+      - nats-network
+
+  nats-2:
+    image: nats:2.10-alpine
+    container_name: nats-2
+    ports:
+      - "4323:4222"
+      - "8323:8222"
+    volumes:
+      - ./nats.conf:/etc/nats/nats.conf
+    command: ["-c", "/etc/nats/nats.conf", "--name", "nats-2", "--cluster_name", "nats-cluster", "--routes", "nats://nats-1:6222"]
+    depends_on:
+      - nats-1
+    networks:
+      - nats-network
+
+  nats-3:
+    image: nats:2.10-alpine
+    container_name: nats-3
+    ports:
+      - "4324:4222"
+      - "8324:8222"
+    volumes:
+      - ./nats.conf:/etc/nats/nats.conf
+    command: ["-c", "/etc/nats/nats.conf", "--name", "nats-3", "--cluster_name", "nats-cluster", "--routes", "nats://nats-1:6222"]
+    depends_on:
+      - nats-1
+    networks:
+      - nats-network
+
+networks:
+  nats-network:
+    driver: bridge

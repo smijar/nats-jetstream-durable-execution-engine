@@ -1,0 +1,26 @@
+syntax = "proto3";
+package ticket;
+option go_package = "github.com/sanjaymijar/my-durable-execution/pb/ticket";
+
+// TicketService - manages ticket reservations
+service TicketService {
+  rpc Reserve(ReserveRequest) returns (ReserveResponse);
+  rpc Release(ReleaseRequest) returns (ReleaseResponse);
+}
+
+message ReserveRequest {
+  string ticket_id = 1;
+}
+
+message ReserveResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message ReleaseRequest {
+  string ticket_id = 1;
+}
+
+message ReleaseResponse {
+  bool success = 1;
+}
