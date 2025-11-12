@@ -601,6 +601,8 @@ See [examples/README.md](examples/README.md) for runnable examples:
 | `delayed-execution/` | Schedule workflows for future | `make run-delayed` |
 | `approval-workflow/` | Awakeables for external callbacks | `make run-approval` |
 | `query-api/` | Query workflow status via HTTP | `make run-query` |
+| `rest-invocation/` | Invoke workflows via HTTP/REST API | `make run-rest` |
+| `direct-grpc-call/` | Call a gRPC service directly (bypassing workflow engine) | `make run-direct-grpc` |
 
 ---
 

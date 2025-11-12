@@ -41,10 +41,51 @@ func NewServer(port int, c *client.Client, processor ProcessorInterface) *Server
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/api/workflows", s.handleListWorkflows)
 	mux.HandleFunc("/api/workflows/stats", s.handleWorkflowStats)
-	mux.HandleFunc("/api/workflows/", s.handleGetWorkflow) // Note: trailing slash for pattern matching
+	mux.HandleFunc("/api/workflows/", s.handleWorkflows) // Note: trailing slash for pattern matching
 	mux.HandleFunc("/api/awakeables/", s.handleResolveAwakeable)
 
 	return s
+}
+
+// handleWorkflows routes requests for /api/workflows/*
+func (s *Server) handleWorkflows(w http.ResponseWriter, r *http.Request) {
+	// Extract path segments
+	path := strings.TrimPrefix(r.URL.Path, "/api/workflows/")
+	parts := strings.Split(path, "/")
+
+	// Route based on method and path
+	if r.Method == http.MethodPost && len(parts) == 2 && parts[1] == "invoke" {
+		s.handleInvokeWorkflow(w, r, parts[0])
+	} else if r.Method == http.MethodGet && len(parts) == 1 && parts[0] != "" {
+		s.handleGetWorkflow(w, r, parts[0])
+	} else {
+		http.NotFound(w, r)
+	}
+}
+
+// handleInvokeWorkflow handles POST /api/workflows/{workflowName}/invoke
+func (s *Server) handleInvokeWorkflow(w http.ResponseWriter, r *http.Request, workflowName string) {
+	// Decode the JSON body into a byte slice
+	var args json.RawMessage
+	if err := json.NewDecoder(r.Body).Decode(&args); err != nil {
+		http.Error(w, fmt.Sprintf("Invalid JSON body: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	// Invoke the workflow
+	invocationID, err := s.client.InvokeAsync(r.Context(), workflowName, client.WithArgs(args))
+	if err != nil {
+		log.Printf("Error invoking workflow %s: %v", workflowName, err)
+		http.Error(w, fmt.Sprintf("Failed to invoke workflow: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Return the invocation ID
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	json.NewEncoder(w).Encode(map[string]string{
+		"invocation_id": invocationID,
+	})
 }
 
 // Start starts the HTTP server
@@ -84,21 +125,11 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleGetWorkflow handles GET /api/workflows/{invocationID}
-func (s *Server) handleGetWorkflow(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleGetWorkflow(w http.ResponseWriter, r *http.Request, invocationID string) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-
-	// Extract invocation ID from URL path
-	// Path format: /api/workflows/{invocationID}
-	path := strings.TrimPrefix(r.URL.Path, "/api/workflows/")
-	if path == "" || path == "stats" {
-		http.Error(w, "Invocation ID required", http.StatusBadRequest)
-		return
-	}
-
-	invocationID := path
 
 	// Get workflow details
 	details, err := s.client.GetWorkflow(r.Context(), invocationID)

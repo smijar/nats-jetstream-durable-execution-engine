@@ -70,6 +70,8 @@ build: generate
 	go build -o bin/ticket-cart ./examples/ticket-cart
 	go build -o bin/delayed-execution ./examples/delayed-execution
 	go build -o bin/approval-workflow ./examples/approval-workflow
+	go build -o bin/rest-invocation ./examples/rest-invocation
+	go build -o bin/direct-grpc-call ./examples/direct-grpc-call
 	@echo "Build complete"
 
 # Start NATS JetStream cluster
@@ -106,12 +108,12 @@ run-client: build
 	./bin/client
 
 # Run simple example (5-line client)
-run-simple: # build
+run-simple: build
 	@echo "Running simple example..."
 	./bin/simple
 
 # Run async example
-run-async: #build
+run-async: build
 	@echo "Running async example..."
 	./bin/async
 
@@ -201,3 +203,13 @@ run-delayed: build
 run-approval: build
 	@echo "Running approval workflow example (awakeables)..."
 	./bin/approval-workflow
+
+# Run REST invocation example
+run-rest: build
+	@echo "Running REST invocation example..."
+	./bin/rest-invocation
+
+# Run direct gRPC call example
+run-direct-grpc: build
+	@echo "Running direct gRPC call example..."
+	./bin/direct-grpc-call

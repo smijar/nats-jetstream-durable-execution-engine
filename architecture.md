@@ -142,8 +142,8 @@ func mainOrderWorkflow(ctx *durable.Context) error {
 
 This pattern is for pausing a workflow to wait for a signal from a system outside the engine, such as a human action or a third-party webhook.
 
-*   **How it works:** The workflow generates a unique `awakeableID` and calls `ctx.Awakeable()`. This suspends the workflow. An external system can then make an HTTP API call to the processor, providing the `awakeableID` and a result. This action "wakes up" the workflow, which resumes execution with the provided result.
-*   **Analogy:** It's like pausing your work to wait for a package delivery. You can't proceed until the delivery person (the external system) rings your doorbell (the API call).
+*   **How it works:** The workflow generates a unique `awakeableID` and calls `ctx.Awakeable()`. This **durably suspends** the workflow. The processor saves the workflow's state and negatively acknowledges the message, causing it to be redelivered later. This creates a resource-efficient "holding pattern". An external system can then make an HTTP API call to the processor, providing the `awakeableID` and a result. This action "wakes up" the workflow, which resumes execution with the provided result on its next attempt.
+*   **Analogy:** It's like pausing your work to wait for a package delivery. You don't stare at the door (busy-wait); you save your progress and do other things. When the delivery person (the external system) rings your doorbell (the API call), you can un-pause and resume your work.
 
 **Inline Example:**
 ```go
@@ -206,3 +206,145 @@ The system provides comprehensive workflow lifecycle management with pause, resu
 3.  **Termination Mechanism:** Instead of a `Nak`, the processor **successfully acknowledges (Ack)** the message. This tells NATS JetStream that it is done with the message.
 
 4.  **Permanent Stop:** Because the command message is removed from the stream, the processor will **never receive it again**. The workflow is permanently stopped.
+
+## Detailed NATS JetStream Integration: The Log-Based Engine
+
+The entire durable execution engine is built upon a log-based architecture, where NATS JetStream provides the durable, replayable log. This approach treats every action as an immutable event that is recorded first, ensuring the system can recover its state perfectly after any failure.
+
+Here’s a breakdown of how the key components in NATS JetStream are used.
+
+### 1. The Command Log (JetStream Stream)
+
+The primary log is a NATS JetStream stream named `COMMANDS`. It serves as the durable, ordered queue for all workflow invocation requests.
+
+*   **Purpose:** To ensure that every request to start or resume a workflow is captured durably and will not be lost.
+*   **Configuration:** The stream is configured in `pkg/jetstream/client.go` to be a work queue that retains messages until they are explicitly acknowledged by a consumer.
+
+    ```go
+    // From: pkg/jetstream/client.go
+
+    // StreamConfig defines the configuration for the command stream
+    var StreamConfig = &nats.StreamConfig{
+    	Name:      "COMMANDS",
+    	Subjects:  []string{"COMMANDS.*"},
+    	Retention: nats.WorkQueuePolicy, // Message is removed once acknowledged
+    	Storage:   nats.FileStorage,
+    }
+    ```
+
+*   **Publishing Commands:** When a client invokes a workflow, it serializes a `durable.Command` protobuf message and publishes it to a subject that the stream is listening on (e.g., `COMMANDS.default`).
+
+    ```go
+    // From: pkg/jetstream/client.go
+
+    // PublishCommand publishes a command to the durable stream
+    func (c *Client) PublishCommand(ctx context.Context, partitionKey string, data []byte) error {
+    	subject := fmt.Sprintf("COMMANDS.%s", partitionKey)
+    	_, err := c.js.Publish(ctx, subject, data)
+    	return err
+    }
+    ```
+
+### 2. The State Store (JetStream KV Bucket)
+
+The state of every single workflow execution is stored in a NATS JetStream Key-Value (KV) bucket named `EXECUTION_STATE`.
+
+*   **Purpose:** To persist the `ExecutionState` protobuf message for each workflow. This message contains the workflow's status, its full journal of completed steps, and any workflow-scoped state (`ctx.Get`/`Set`).
+*   **Configuration:** The KV bucket is also defined in `pkg/jetstream/client.go`. The key is the unique `invocation_id` of the workflow.
+
+    ```go
+    // From: pkg/jetstream/client.go
+
+    // StateKVConfig defines the configuration for the execution state KV bucket
+    var StateKVConfig = &nats.KeyValueConfig{
+    	Bucket:  "EXECUTION_STATE",
+    	Storage: nats.FileStorage,
+    }
+    ```
+
+*   **Saving and Loading State:** The processor interacts with this KV bucket before and after executing workflow logic.
+
+    ```go
+    // From: pkg/execution/processor.go
+
+    // loadState loads execution state from KV bucket
+    func (p *Processor) loadState(ctx context.Context, invocationID string) (*durable.ExecutionState, error) {
+    	entry, err := p.kv.Get(ctx, invocationID)
+    	if err != nil {
+    		// ... handle not found ...
+    	}
+    	var state durable.ExecutionState
+    	proto.Unmarshal(entry.Value(), &state)
+    	return &state, nil
+    }
+
+    // saveState saves execution state to KV bucket atomically
+    func (p *Processor) saveState(ctx context.Context, state *durable.ExecutionState) error {
+    	data, err := proto.Marshal(state)
+    	// ... handle error ...
+    	_, err = p.kv.Put(ctx, state.InvocationId, data)
+    	return err
+    }
+    ```
+
+### 3. The Processor's Consumption and Ack/Nak Logic
+
+This is the most critical part of the engine, where the command log and state store come together. The processor consumes messages from the `COMMANDS` stream and uses the `EXECUTION_STATE` KV to decide what to do.
+
+*   **Purpose:** To read a command, execute the corresponding workflow logic, and then explicitly acknowledge (`Ack`) or negatively acknowledge (`Nak`) the message to control its lifecycle in the stream.
+*   **Implementation:** The core logic resides in the `processMessage` function in `pkg/execution/processor.go`.
+
+    ```go
+    // From: pkg/execution/processor.go
+
+    // processMessage processes a single command message
+    func (p *Processor) processMessage(ctx context.Context, msg natsjs.Msg) error {
+    	// ... unmarshal command ...
+
+    	// Load the workflow's current state from the KV store
+    	state, err := p.loadState(ctx, cmd.InvocationId)
+    	// ... handle error ...
+
+    	// Check the status from the state store
+    	if state != nil {
+    		switch state.Status {
+    		case "completed", "cancelled":
+    			// If already done, just Ack the message to remove it from the stream
+    			log.Printf("Execution already completed/cancelled: %s", cmd.InvocationId)
+    			return nil // This will lead to an Ack
+    		case "paused":
+    			// If paused, Nak the message to have it redelivered later
+    			log.Printf("Execution paused: %s (will retry later)", cmd.InvocationId)
+    			return fmt.Errorf("execution paused: %s", cmd.InvocationId) // This will lead to a Nak
+    		}
+    	}
+
+    	// ... create durable context and replay journal ...
+
+    	// Execute the actual workflow handler
+    	if err := handler(durableContext); err != nil {
+    		// If the handler fails (e.g., waiting for an awakeable or a real error)
+    		// Nak the message so it gets retried.
+    		log.Printf("Handler execution failed: %v", err)
+    		state.Status = "failed"
+    		p.saveState(ctx, state) // Save the "failed" status
+    		return fmt.Errorf("handler execution failed: %w", err)
+    	}
+
+    	// If everything was successful:
+    	state.Status = "completed"
+    	if err := p.saveState(ctx, state); err != nil {
+    		// If we can't save the final state, Nak to retry the whole step
+    		return fmt.Errorf("failed to save final state: %w", err)
+    	}
+
+    	log.Printf("Execution completed successfully: %s", cmd.InvocationId)
+    	// A nil return here signals the message can be Ack'd and removed.
+    	return nil
+    }
+    ```
+
+This `Ack`/`Nak` logic is the engine that drives everything:
+*   A successful run results in an `Ack`, completing the workflow.
+*   A temporary failure or a "paused" state results in a `Nak`, ensuring the workflow will be retried.
+*   A permanent cancellation results in an `Ack`, ensuring the workflow is never run again.
